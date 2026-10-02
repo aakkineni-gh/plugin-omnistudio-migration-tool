@@ -319,11 +319,17 @@ export class OrgUtils {
 
     let isOrgOwnedNamespace = false;
 
-    const installedOmniPackages = [];
+    let installedOmniPackages: InstalledPackage[] = [];
     for (const pkg of allInstalledPackages) {
       if (this.namespaces.has(pkg.NamespacePrefix)) {
         installedOmniPackages.push(pkg);
       }
+    }
+
+    // Drop extension packages (e.g. vlocity_ins_fsc on top of vlocity_ins) that don't contain OmniStudio components,
+    // so the user isn't offered a namespace that can't be migrated
+    if (installedOmniPackages.length > 1) {
+      installedOmniPackages = await this.filterPackagesWithOmniStudioComponents(connection, installedOmniPackages);
     }
 
     // Handle multiple packages by prompting user to select one
@@ -416,6 +422,45 @@ export class OrgUtils {
       isOmnistudioMetadataAPIEnabled: isOmnistudioMetadataAPIEnabled,
       isOrgOwnedNamespace: isOrgOwnedNamespace,
     };
+  }
+
+  /**
+   * Keeps only the packages whose namespace contains OmniStudio components (`<ns>__OmniScript__c`).
+   * The Foundation package is always kept because it doesn't ship the custom OmniStudio objects.
+   * Uses the Tooling API so the check doesn't depend on the running user's object permissions.
+   * Falls back to the unfiltered list if the check fails or no package qualifies.
+   */
+  private static async filterPackagesWithOmniStudioComponents(
+    connection: Connection,
+    packages: InstalledPackage[]
+  ): Promise<InstalledPackage[]> {
+    const isFoundation = (pkg: InstalledPackage): boolean => pkg.NamespacePrefix === Constants.FoundationPackageName;
+    const packagesToCheck = packages.filter((pkg) => !isFoundation(pkg));
+    if (packagesToCheck.length === 0) {
+      return packages;
+    }
+
+    try {
+      const objectNames = packagesToCheck.map((pkg) => `'${pkg.NamespacePrefix}__OmniScript__c'`).join(',');
+      const result = await connection.tooling.query<{ QualifiedApiName: string }>(
+        `SELECT QualifiedApiName FROM EntityDefinition WHERE QualifiedApiName IN (${objectNames})`
+      );
+      const foundObjects = new Set((result?.records ?? []).map((r) => r.QualifiedApiName.toLowerCase()));
+      const hasOmniStudioComponents = (pkg: InstalledPackage): boolean =>
+        isFoundation(pkg) || foundObjects.has(`${pkg.NamespacePrefix}__omniscript__c`.toLowerCase());
+
+      const filtered = packages.filter(hasOmniStudioComponents);
+      if (filtered.length === 0) {
+        return packages;
+      }
+      for (const pkg of packages.filter((p) => !hasOmniStudioComponents(p))) {
+        Logger.log(messages.getMessage('skippingPackageWithoutOmniStudioComponents', [pkg.NamespacePrefix]));
+      }
+      return filtered;
+    } catch (error) {
+      Logger.logVerbose(error);
+      return packages;
+    }
   }
 
   /**     *
